@@ -7,6 +7,9 @@
 > [!IMPORTANT]
 > This is designed for learning, development, and **light production-like workloads**, not for high availability or heavy simultaneous builds. Everything runs on **one physical server**. Confirm current VM IDs, IP availability, and Proxmox storage capacity before provisioning.
 
+> [!TIP]
+> New to a tool in this plan? Each technology has a beginner guide in [`docs/`](docs/README.md) — start with [`docs/00-overview`](docs/00-overview/README.md).
+
 ### What changed from v1
 
 | Area | v1 | v2 | Why |
@@ -16,12 +19,12 @@
 | Gateway | VM, 1 GB | **LXC, 512 MB** | Nginx + cloudflared don't need a full VM |
 | PostgreSQL | VM, 3 GB | **LXC, 3 GB** | Lower overhead, near-native I/O |
 | K3s workers | 3 × 4 GB | **2 × 6 GB** | Less duplicated OS/agent overhead; ~5 GB usable per node instead of ~3 GB |
-| Jenkins builds | On the Jenkins VM | **Ephemeral K3s pod agents** (BuildKit/Kaniko) | Builds get pod limits instead of starving the host |
+| Jenkins builds | On the Jenkins VM | **Ephemeral K3s pod agents** (rootless BuildKit) | Builds get pod limits instead of starving the host |
 | Deploys | Jenkins → kubectl | **Jenkins = CI, Flux = CD (GitOps)** | Git is the source of truth; no cluster-admin creds in Jenkins |
 | Registry | Unspecified | **GHCR** (or `registry:2` on hosting VM) | Was a missing piece |
 | Provisioning | Manual | **OpenTofu + Ansible** | Reproducible rebuilds |
 | Secrets | Unspecified | **SOPS + age** | Safe secrets in Git |
-| Backups | "Off-server" | **Proxmox Backup Server on a second HDD** + off-site sync | Uses the ML30's spare LFF bays |
+| Backups | "Off-server" | **restic (daily data) + vzdump (weekly guests) → Cloudflare R2** | No extra disk needed; rebuild the rest from Git |
 | Remote admin | Unspecified | **Tailscale** + iLO 5 | Never expose Proxmox/SSH publicly |
 
 ## 1. Physical hardware
@@ -31,8 +34,8 @@
 | Server | HPE ProLiant ML30 Gen10 4LFF Hot-Plug CTO |
 | CPU | Intel Xeon E-2224, **4 physical cores / 4 threads** |
 | Memory | **32 GB RAM** (platform max 64 GB ECC UDIMM, 4 slots) |
-| Drive | **500 GB SSD** (Proxmox + all guests) |
-| Backup drive (planned) | **2–4 TB 3.5" HDD** in a spare LFF bay for Proxmox Backup Server |
+| Drive | **500 GB SSD** (Proxmox + all guests) — the only disk |
+| Backup target | **Off-site object storage (Cloudflare R2)** — no local backup disk |
 | Out-of-band | **iLO 5** (private management network only) |
 | Hypervisor | Proxmox VE |
 | Guests | **5 VMs + 2 LXC containers** |
@@ -46,7 +49,7 @@
 |---|---:|---:|---|
 | RAM | **25 GB** | **~7 GB** | For Proxmox, page cache, KSM, and overhead. |
 | vCPU | **15 vCPUs** | **4 physical cores** | ~3.75:1 overcommit. Fine at light load; CPU contention slows things, it doesn't crash the host. |
-| Disk | **278 GB** | **~120 GB of ~400 GiB thin pool** | Headroom for snapshots and growth. Verify with `pvesm status`. |
+| Disk | **278 GB guests + 50 GB backup staging = 328 GB** | **~70 GB of ~400 GiB thin pool** | Headroom for snapshots and growth. Verify with `pvesm status`. |
 
 ## 2. Proxmox host setup
 
@@ -74,6 +77,19 @@ In the installer's **Advanced Options** for the target disk:
 - Startup order: `postgres (1) → k3s-server (2) → workers (3) → jenkins/hosting/gateway (4)`, with 30–60 s delays.
 - Configure **iLO 5** for remote console/power; keep it on the private LAN.
 
+### Backup staging area
+
+A 50 GB thin volume holds weekly `vzdump` files only until they are uploaded to R2 (see §14). It is on the same SSD, so it is **not** a backup by itself.
+
+```bash
+lvcreate -V 50G -T pve/data -n backup-staging
+mkfs.ext4 /dev/pve/backup-staging
+mkdir -p /mnt/backup-staging
+echo '/dev/pve/backup-staging /mnt/backup-staging ext4 defaults,discard 0 2' >> /etc/fstab
+mount -a
+pvesm add dir backup-staging --path /mnt/backup-staging --content backup --is_mountpoint yes
+```
+
 ### Thin-pool safety
 
 Thin provisioning lets virtual disks exceed physical space. **A full thin pool can corrupt every guest at once.** Keep total allocated disk below the pool size and alert at 80%.
@@ -89,6 +105,7 @@ lvs -o lv_name,data_percent,metadata_percent pve
 | Setting | Planned value |
 |---|---|
 | Proxmox management | `192.168.0.200` (verify actual address) |
+| iLO 5 | `192.168.0.210` (private only) |
 | Router / default gateway | `192.168.0.1` |
 | LAN subnet | `192.168.0.0/24` |
 | Linux bridge | `vmbr0` |
@@ -127,8 +144,8 @@ flowchart TB
     cf --> tunnel["Cloudflare Tunnel — outbound connection"]
     admin["Admin laptop"] -. "Tailscale" .-> pve
 
-    subgraph host["HPE ML30 Gen10 · Proxmox VE · 32 GB RAM · 500 GB SSD + backup HDD"]
-        pve["Proxmox host\n192.168.0.200\n+ Proxmox Backup Server datastore (HDD)"]
+    subgraph host["HPE ML30 Gen10 · Proxmox VE · 32 GB RAM · 500 GB SSD"]
+        pve["Proxmox host\n192.168.0.200\nvzdump + rclone + restic"]
         gateway["LXC 100 — gateway\n192.168.0.220 · 0.5 GB\ncloudflared + Nginx"]
         tunnel --> gateway
 
@@ -172,6 +189,8 @@ flowchart TB
     agents -->|"bump image tag"| git
     flux -->|"pull manifests"| git
     flux -->|"pull images"| ghcr
+    r2["Cloudflare R2\n(off-site backups)"]
+    pve -->|"weekly guests + daily data"| r2
 ```
 
 **Web request flow:** `Client → Cloudflare → cloudflared (LXC 100) → Nginx → (Traefik VIP OR Jenkins OR Hosting VM)`.
@@ -328,7 +347,7 @@ Monitoring runs **in K3s**; there is no monitoring VM.
 - Jenkins queue growing / repeated failures.
 - PostgreSQL down or connection saturation.
 - Nginx 5xx rate high; monitoring targets down.
-- PBS backup job failed or not run in 26 h.
+- Backup job (restic or vzdump upload) failed or not run on schedule.
 
 Monitoring shares the host, so a **host outage silences alerts**. Add an **external uptime check** (e.g., Cloudflare Health Checks, UptimeRobot, Healthchecks.io) for public endpoints and a backup heartbeat.
 
@@ -350,7 +369,7 @@ git push (app repo)
   → GitHub webhook → Jenkins controller (VM 106)
   → Kubernetes plugin spawns ephemeral build pod on a worker
       → unit tests
-      → build image with BuildKit (rootless) or Kaniko
+      → build image with rootless BuildKit (Kaniko is archived — don't use it)
       → push to ghcr.io/<user>/<app>:<git-sha>
       → commit new image tag to homelab-infra repo
   → Flux detects change → applies to K3s
@@ -372,7 +391,7 @@ Safeguards:
 - IP `192.168.0.225`, port `5432` **private**
 - `pg_hba.conf` allows only K3s worker IPs (pod traffic is SNAT'd to node IPs by flannel) and Jenkins if needed
 - Per-app roles/databases, strong passwords, TLS for sensitive data
-- Nightly `pg_dump` to the PBS/HDD datastore **and** off-site; test restores
+- Nightly `pg_dump`, uploaded off-site by restic (§14); test restores
 - Proxmox firewall on the container: allow 5432 only from `.222`, `.223`
 
 ## 12. Infrastructure as code
@@ -403,14 +422,20 @@ Goal: any guest can be destroyed and rebuilt from Git + backups.
 
 ## 14. Backups
 
+There is **no local backup disk**. The strategy is: **rebuild machines from Git (IaC), restore data from off-site.**
+
 | What | Tool | Destination | Schedule | Retention |
 |---|---|---|---|---|
-| All VMs/LXCs | **Proxmox Backup Server** (on host, datastore on HDD) | 2–4 TB HDD in LFF bay | Nightly | 7 daily, 4 weekly, 3 monthly |
-| PostgreSQL | `pg_dump` | PBS datastore + off-site | Nightly | 14 days |
-| Off-site copy | PBS sync / `rclone` | Cloud (Backblaze B2 / R2) or second machine | Weekly | 4 weeks |
+| **Data** — PostgreSQL dumps, Jenkins home, hosting Docker volumes, Grafana DB | **restic** (encrypted, deduplicated) | **Cloudflare R2** bucket | Daily | 7 daily, 4 weekly, 6 monthly |
+| **Whole guests** — 101 (K3s datastore), 105, 106, 107 | **vzdump** (zstd, snapshot mode) → 50 GB staging → **rclone** | Cloudflare R2 bucket | Weekly | 1 local (staging), 4 in R2 |
+| Workers 102/103, gateway 100 | Not backed up | — | — | Rebuilt from OpenTofu + Ansible + Flux |
 | Infra config | Git | GitHub | On change | Full history |
 
-The HDD protects against SSD failure and bad changes, **not** against loss of the whole server — off-site copy is required for that. Test a VM restore and a DB restore at least once.
+- **Cost estimate:** R2 gives 10 GB free, then about **US$0.015 per GB-month** with no download (egress) fees. 50–150 GB ≈ **US$1–2/month**. Backblaze B2 is a similar alternative.
+- **Upload speed matters:** the first weekly vzdump upload may take hours on a home connection; schedule it at night.
+- **restic password and R2 keys** must also be stored **outside** the server (password manager), or the backups are useless.
+- Test a DB restore and a full guest restore (download from R2 → `qmrestore`/`pct restore`) at least once.
+- Without a local backup disk, a restore needs a download first — expect slower recovery.
 
 ## 15. Stability and failure planning
 
@@ -421,7 +446,7 @@ The HDD protects against SSD failure and bad changes, **not** against loss of th
 | Sustained 100% CPU | Timeouts, probe failures | Reduce load; check which guest |
 | Memory exhaustion | OOM kills of pods/guests | Limits, PriorityClasses, host memory alert |
 | **Thin pool full** | **All guests I/O-error, possible corruption** | Alert at 80%; keep allocations < pool size |
-| SSD failure | All guests down | Restore from PBS HDD / off-site |
+| SSD failure | All guests down | Replace SSD, reinstall Proxmox, rebuild from Git, restore data from R2 |
 | Whole server lost | Everything down | Rebuild from Git (IaC) + off-site backups |
 
 ## 16. Deployment phases and acceptance checks
@@ -432,7 +457,7 @@ The HDD protects against SSD failure and bad changes, **not** against loss of th
 - [ ] Verify CPU, 32 GB RAM, SSD SMART health.
 - [ ] Install Proxmox with `maxroot=30`, `swapsize=4`, `minfree=16`; confirm `local-lvm` ≈ 400 GiB.
 - [ ] Configure no-subscription repo, updates, Proxmox firewall, Tailscale.
-- [ ] Install backup HDD; set up Proxmox Backup Server datastore.
+- [ ] Create the 50 GB `backup-staging` storage; create an R2 bucket and API token.
 - [ ] Confirm free guest IDs and `.220`–`.229` IPs.
 
 ### Phase 1 — IaC and guests
@@ -478,7 +503,7 @@ The HDD protects against SSD failure and bad changes, **not** against loss of th
 
 ### Phase 7 — Operations readiness
 
-- [ ] PBS nightly jobs green; off-site sync configured.
+- [ ] Daily restic and weekly vzdump → R2 jobs green; secrets saved in a password manager.
 - [ ] Test restore: one VM, one LXC, one database.
 - [ ] Test rebuild: destroy and recreate a worker from IaC.
 - [ ] Revoke a Cloudflare Access session and confirm lockout.
@@ -525,26 +550,25 @@ Jenkins and Grafana should redirect to Cloudflare Access before authentication.
 
 **Approved target layout:**
 
-- **5 VMs + 2 LXCs**, **25 GB RAM**, **15 vCPUs**, **278 GB disk**.
-- **~7 GB host RAM headroom**, **~120 GB thin-pool headroom**.
+- **5 VMs + 2 LXCs**, **25 GB RAM**, **15 vCPUs**, **278 GB guest disk + 50 GB backup staging**.
+- **~7 GB host RAM headroom**, **~70 GB thin-pool headroom**.
 - K3s **1 server + 2 workers (6 GB each)**; monitoring and CI agents in-cluster.
 - **Jenkins CI + Flux GitOps**, images in **GHCR**.
 - **Cloudflare Tunnel → Nginx (LXC) → K3s / Jenkins / hosting**.
-- Everything defined in **OpenTofu + Ansible + Flux**; backups to **PBS on HDD + off-site**.
+- Everything defined in **OpenTofu + Ansible + Flux**; backups **off-site to Cloudflare R2** (restic + vzdump).
 
 **Upgrade order:**
 
-1. **Backup HDD** (if not already installed) — do this first.
-2. **RAM → 64 GB** (4 × 16 GB ECC UDIMM) — cheapest, biggest gain; then add `k3s-worker3` (VM 104) and raise worker RAM.
-3. **Second SSD** — separate guest data from the Proxmox OS, or mirror.
-4. **CPU** (e.g., Xeon E-2236/E-2246G, 6C/12T — verify ML30 Gen10 compatibility and BIOS) only if sustained CPU contention becomes normal.
+1. **RAM → 64 GB** (4 × 16 GB ECC UDIMM) — cheapest, biggest gain; then add `k3s-worker3` (VM 104) and raise worker RAM.
+2. **Second disk** — a local backup disk (faster restores) or a second SSD for guest data / mirroring.
+3. **CPU** (e.g., Xeon E-2236/E-2246G, 6C/12T — verify ML30 Gen10 compatibility and BIOS) only if sustained CPU contention becomes normal.
 
 ---
 
 ## 19. Official reference documentation
 
 - Proxmox VE: <https://pve.proxmox.com/pve-docs/>
-- Proxmox Backup Server: <https://pbs.proxmox.com/docs/>
+- restic: <https://restic.readthedocs.io/> · rclone: <https://rclone.org/docs/> · Cloudflare R2: <https://developers.cloudflare.com/r2/>
 - K3s: <https://docs.k3s.io/>
 - kube-vip: <https://kube-vip.io/docs/>
 - Flux: <https://fluxcd.io/flux/>
