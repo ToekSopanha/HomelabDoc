@@ -1,39 +1,90 @@
-# HPE ProLiant ML30 Gen10 — Final Proxmox DevOps Homelab Plan
+# HPE ProLiant ML30 Gen10 — Final Proxmox DevOps Homelab Plan (v2)
 
 **Status:** Proposed architecture / implementation reference  
-**Date:** 2026-11-08  
-**Goal:** Run an eight-VM DevOps homelab with K3s, dedicated hosting, Jenkins CI/CD, PostgreSQL, Cloudflare Tunnel, and centralized monitoring **within 32 GB RAM**.
+**Date:** 2026-11-17 (revised from 2026-11-08 plan)  
+**Goal:** Run a DevOps homelab with K3s, dedicated hosting, Jenkins CI, GitOps CD, PostgreSQL, Cloudflare Tunnel, and centralized monitoring **within 32 GB RAM and a single 500 GB SSD**.
 
 > [!IMPORTANT]
 > This is designed for learning, development, and **light production-like workloads**, not for high availability or heavy simultaneous builds. Everything runs on **one physical server**. Confirm current VM IDs, IP availability, and Proxmox storage capacity before provisioning.
+
+### What changed from v1
+
+| Area | v1 | v2 | Why |
+|---|---|---|---|
+| Proxmox install | Default disk layout | `maxroot=30`, `swapsize=4`, `minfree=16` | Default layout leaves only ~340 GiB for VM disks — v1's 350 GB did not fit |
+| Storage backend | Unspecified | **LVM-thin** + `discard=on`, `ssd=1` | ZFS ARC competes for RAM on a 32 GB single-disk host |
+| Gateway | VM, 1 GB | **LXC, 512 MB** | Nginx + cloudflared don't need a full VM |
+| PostgreSQL | VM, 3 GB | **LXC, 3 GB** | Lower overhead, near-native I/O |
+| K3s workers | 3 × 4 GB | **2 × 6 GB** | Less duplicated OS/agent overhead; ~5 GB usable per node instead of ~3 GB |
+| Jenkins builds | On the Jenkins VM | **Ephemeral K3s pod agents** (BuildKit/Kaniko) | Builds get pod limits instead of starving the host |
+| Deploys | Jenkins → kubectl | **Jenkins = CI, Flux = CD (GitOps)** | Git is the source of truth; no cluster-admin creds in Jenkins |
+| Registry | Unspecified | **GHCR** (or `registry:2` on hosting VM) | Was a missing piece |
+| Provisioning | Manual | **OpenTofu + Ansible** | Reproducible rebuilds |
+| Secrets | Unspecified | **SOPS + age** | Safe secrets in Git |
+| Backups | "Off-server" | **Proxmox Backup Server on a second HDD** + off-site sync | Uses the ML30's spare LFF bays |
+| Remote admin | Unspecified | **Tailscale** + iLO 5 | Never expose Proxmox/SSH publicly |
 
 ## 1. Physical hardware
 
 | Component | Specification |
 |---|---|
 | Server | HPE ProLiant ML30 Gen10 4LFF Hot-Plug CTO |
-| CPU | Intel Xeon E-2224, **4 physical cores / 4 threads** (assumed from existing configuration) |
-| Memory | **32 GB RAM** |
-| Drive | **500 GB SSD** |
+| CPU | Intel Xeon E-2224, **4 physical cores / 4 threads** |
+| Memory | **32 GB RAM** (platform max 64 GB ECC UDIMM, 4 slots) |
+| Drive | **500 GB SSD** (Proxmox + all guests) |
+| Backup drive (planned) | **2–4 TB 3.5" HDD** in a spare LFF bay for Proxmox Backup Server |
+| Out-of-band | **iLO 5** (private management network only) |
 | Hypervisor | Proxmox VE |
-| Virtual machines | **8** |
-| Cluster | K3s: **1 control-plane server + 3 agents (workers)** |
+| Guests | **5 VMs + 2 LXC containers** |
+| Cluster | K3s: **1 control-plane server + 2 agents (workers)** |
 | External access | **Cloudflare Tunnel → Nginx gateway** |
 | Monitoring | **Grafana + Prometheus + Loki + Alloy**, hosted as **K3s workloads** |
 
 ### Capacity targets
 
-| Resource | Allocated to VMs | Nominal remainder | Notes |
+| Resource | Allocated to guests | Nominal remainder | Notes |
 |---|---:|---:|---|
-| RAM | **26 GB** | **6 GB** | Remaining memory is for Proxmox, host caching, and overhead; not a guarantee of 6 GB always free. |
-| vCPU | **14 vCPUs** | **4 physical cores total** | 3.5:1 vCPU-to-physical-core allocation. vCPUs share host CPU time. |
-| Virtual disk | **350 GB** | **150 GB vs 500 GB nominal SSD size** | Proxmox OS, storage pools, thin provisioning, metadata, snapshots, and backups reduce actual available space. Verify `pvesm status`. |
+| RAM | **25 GB** | **~7 GB** | For Proxmox, page cache, KSM, and overhead. |
+| vCPU | **15 vCPUs** | **4 physical cores** | ~3.75:1 overcommit. Fine at light load; CPU contention slows things, it doesn't crash the host. |
+| Disk | **278 GB** | **~120 GB of ~400 GiB thin pool** | Headroom for snapshots and growth. Verify with `pvesm status`. |
 
-**CPU guidance:** A busy CPU does not normally crash Proxmox by itself. CPU contention causes slower applications, delayed jobs, and possible timeouts/liveness-probe failures. Heavy memory pressure, full disks, thermal faults, or physical hardware problems are greater stability risks.
+## 2. Proxmox host setup
+
+### Install-time disk layout (500 GB SSD, ext4/LVM)
+
+In the installer's **Advanced Options** for the target disk:
+
+| Option | Value | Effect |
+|---|---|---|
+| `hdsize` | (full disk) | |
+| `swapsize` | `4` | 4 GiB host swap |
+| `maxroot` | `30` | 30 GiB for Proxmox OS, ISOs, templates |
+| `minfree` | `16` | Free space left in the VG for LVM snapshots |
+| `maxvz` | (leave empty) | Rest → `local-lvm` thin pool (≈ 400 GiB) |
+
+**Storage backend:** **LVM-thin** for guest disks. If ZFS is used anyway, cap ARC (`options zfs zfs_arc_max=2147483648` in `/etc/modprobe.d/zfs.conf`).
+
+### Host tuning
+
+- Every virtual disk: `discard=on`, `ssd=1`, VirtIO SCSI single, `iothread=1`. Enable `fstrim.timer` inside guests.
+- VM CPU type: **`host`** (single node, no live migration concern).
+- Leave **KSM** enabled — identical Ubuntu guests share memory pages.
+- Install `qemu-guest-agent` in every VM.
+- Do not overcommit RAM; disable ballooning on K3s nodes (Kubernetes needs predictable memory).
+- Startup order: `postgres (1) → k3s-server (2) → workers (3) → jenkins/hosting/gateway (4)`, with 30–60 s delays.
+- Configure **iLO 5** for remote console/power; keep it on the private LAN.
+
+### Thin-pool safety
+
+Thin provisioning lets virtual disks exceed physical space. **A full thin pool can corrupt every guest at once.** Keep total allocated disk below the pool size and alert at 80%.
+
+```bash
+lvs -o lv_name,data_percent,metadata_percent pve
+```
 
 ---
 
-## 2. Network plan
+## 3. Network plan
 
 | Setting | Planned value |
 |---|---|
@@ -41,110 +92,122 @@
 | Router / default gateway | `192.168.0.1` |
 | LAN subnet | `192.168.0.0/24` |
 | Linux bridge | `vmbr0` |
-| VM IPs | `192.168.0.220` – `192.168.0.227` |
+| Guest IPs | `192.168.0.220` – `192.168.0.227` |
+| K3s ingress VIP (optional, kube-vip) | `192.168.0.229` |
 | Primary domain | `sopanha.digital` |
-| Guest OS | Ubuntu Server 24.04 LTS (suggested baseline) |
-| VM SSH authentication | SSH public keys, not reused passwords |
+| Guest OS | Ubuntu Server 24.04 LTS (VMs) / Ubuntu 24.04 LXC template |
+| Authentication | SSH public keys only |
+| Remote admin | **Tailscale** on Proxmox host (subnet router) — not public ports |
 
-**Before deployment:** Ensure `.220`–`.227` are unused and reserved/excluded from the DHCP pool. The VM IDs 100–107 might conflict with an earlier Proxmox homelab; **never overwrite or destroy existing VMs**. Replace IDs with available ones if necessary.
+**Before deployment:** Ensure `.220`–`.229` are unused and excluded from the DHCP pool. IDs 100–107 might conflict with an earlier homelab; **never overwrite or destroy existing guests**. Use free IDs if necessary.
 
-## 3. Final VM allocation
+## 4. Final guest allocation
 
-| VM ID | Hostname | Role | vCPU | RAM | Disk | Static IP |
-|---:|---|---|---:|---:|---:|---|
-| 100 | `nginx-gateway` | Nginx reverse proxy + `cloudflared` | 1 | **1 GB** | 15 GB | `192.168.0.220` |
-| 101 | `k3s-master` | K3s control plane | 2 | **3 GB** | 25 GB | `192.168.0.221` |
-| 102 | `k3s-worker1` | K3s agent + apps + monitoring | 2 | **4 GB** | 50 GB | `192.168.0.222` |
-| 103 | `k3s-worker2` | K3s agent + apps + monitoring | 2 | **4 GB** | 50 GB | `192.168.0.223` |
-| 104 | `k3s-worker3` | K3s agent + apps + monitoring | 2 | **4 GB** | 50 GB | `192.168.0.224` |
-| 105 | `database` | PostgreSQL, private LAN only | 2 | **3 GB** | 60 GB | `192.168.0.225` |
-| 106 | `jenkins` | Jenkins CI/CD | 2 | **3 GB** | 60 GB | `192.168.0.226` |
-| 107 | `hosting-server` | Ubuntu + Docker/Compose for independent apps | 1 | **4 GB** | 40 GB | `192.168.0.227` |
-| **TOTAL** | **8 VMs** | | **14** | **26 GB** | **350 GB** | |
+| ID | Hostname | Type | Role | vCPU | RAM | Disk | Static IP |
+|---:|---|---|---|---:|---:|---:|---|
+| 100 | `gateway` | **LXC** (unprivileged) | Nginx reverse proxy + `cloudflared` | 1 | **0.5 GB** | 8 GB | `192.168.0.220` |
+| 101 | `k3s-server` | VM | K3s control plane (tainted, no app pods) | 2 | **3 GB** | 30 GB | `192.168.0.221` |
+| 102 | `k3s-worker1` | VM | K3s agent + apps + monitoring + CI agents | 3 | **6 GB** | 60 GB | `192.168.0.222` |
+| 103 | `k3s-worker2` | VM | K3s agent + apps + monitoring + CI agents | 3 | **6 GB** | 60 GB | `192.168.0.223` |
+| 104 | — | — | *Reserved (future worker when RAM → 64 GB)* | — | — | — | `192.168.0.224` |
+| 105 | `postgres` | **LXC** (unprivileged) | PostgreSQL, private LAN only | 2 | **3 GB** | 50 GB | `192.168.0.225` |
+| 106 | `jenkins` | VM | Jenkins controller only (no local builds) | 2 | **2.5 GB** | 30 GB | `192.168.0.226` |
+| 107 | `hosting-server` | VM | Ubuntu + Docker/Compose for independent apps | 2 | **4 GB** | 40 GB | `192.168.0.227` |
+| **TOTAL** | | **5 VMs + 2 LXC** | | **15** | **25 GB** | **278 GB** | |
 
-**Why there is no ninth monitoring VM:** Grafana, Prometheus, and Loki run in K3s and use resources **inside the three 4 GB worker allocations**. VM 107 stays available as a **dedicated hosting server**.
+**Why 2 workers instead of 3:** all workers share one physical host, so a third worker adds no real redundancy — only another copy of Ubuntu, kubelet, flannel, Alloy, and node-exporter (~0.7–1 GB). Two 6 GB workers give each node room for Prometheus/Loki without evicting apps. VM 104 is reserved to add a third worker after a RAM upgrade.
 
-## 4. End-to-end infrastructure diagram
+**Why no monitoring VM:** Grafana, Prometheus, and Loki run in K3s within the worker allocations. VM 107 stays a **dedicated hosting server**.
+
+## 5. End-to-end infrastructure diagram
 
 ```mermaid
 flowchart TB
     users["Internet users / administrators"] --> cf["Cloudflare DNS + HTTPS + Zero Trust Access"]
     cf --> tunnel["Cloudflare Tunnel — outbound connection"]
+    admin["Admin laptop"] -. "Tailscale" .-> pve
 
-    subgraph host["HPE ML30 Gen10 · Proxmox VE · 32 GB RAM · 500 GB SSD"]
-        gateway["VM 100 — nginx-gateway\n192.168.0.220 · 1 GB\ncloudflared + Nginx"]
+    subgraph host["HPE ML30 Gen10 · Proxmox VE · 32 GB RAM · 500 GB SSD + backup HDD"]
+        pve["Proxmox host\n192.168.0.200\n+ Proxmox Backup Server datastore (HDD)"]
+        gateway["LXC 100 — gateway\n192.168.0.220 · 0.5 GB\ncloudflared + Nginx"]
         tunnel --> gateway
 
-        subgraph cluster["K3s cluster (15 GB allocated across four VMs)"]
-            master["VM 101 — k3s-master\n192.168.0.221 · 3 GB"]
-            w1["VM 102 — worker1\n192.168.0.222 · 4 GB"]
-            w2["VM 103 — worker2\n192.168.0.223 · 4 GB"]
-            w3["VM 104 — worker3\n192.168.0.224 · 4 GB"]
-            traefik["Traefik Ingress + K3s Services"]
-            apps["Kubernetes apps / APIs / bots"]
-            mon["Grafana + Prometheus + Loki + Alloy\nKubernetes monitoring workloads"]
-            master -. schedules / manages .-> w1
-            master -. schedules / manages .-> w2
-            master -. schedules / manages .-> w3
-            traefik --> apps
+        subgraph cluster["K3s cluster (15 GB across three VMs)"]
+            master["VM 101 — k3s-server\n192.168.0.221 · 3 GB"]
+            w1["VM 102 — worker1\n192.168.0.222 · 6 GB"]
+            w2["VM 103 — worker2\n192.168.0.223 · 6 GB"]
+            traefik["Traefik Ingress (VIP .229)"]
+            apps["Apps / APIs / bots"]
+            mon["Grafana + Prometheus + Loki + Alloy"]
+            flux["Flux (GitOps)"]
+            agents["Jenkins build agents (ephemeral pods)"]
+            master -. manages .-> w1
+            master -. manages .-> w2
             w1 --- traefik
             w2 --- traefik
-            w3 --- traefik
+            traefik --> apps
             w1 --- mon
             w2 --- mon
-            w3 --- mon
         end
 
-        db["VM 105 — database\n192.168.0.225 · 3 GB\nPostgreSQL"]
-        jenkins["VM 106 — jenkins\n192.168.0.226 · 3 GB\nCI/CD"]
-        hosting["VM 107 — hosting-server\n192.168.0.227 · 4 GB\nDocker Compose services"]
+        db["LXC 105 — postgres\n192.168.0.225 · 3 GB"]
+        jenkins["VM 106 — jenkins controller\n192.168.0.226 · 2.5 GB"]
+        hosting["VM 107 — hosting-server\n192.168.0.227 · 4 GB\nDocker Compose"]
 
         gateway -->|"app / api / grafana"| traefik
         gateway -->|"jenkins"| jenkins
         gateway -->|"hosting / n8n"| hosting
         apps -->|"private DB access"| db
-        jenkins -. "deploy approved releases" .-> master
-        mon -. "scrape metrics / receive logs" .-> db
-        mon -. "scrape metrics / receive logs" .-> jenkins
-        mon -. "scrape metrics / receive logs" .-> gateway
-        mon -. "scrape metrics / receive logs" .-> hosting
+        jenkins -->|"spawns build pods"| agents
+        mon -. "scrape / logs" .-> db
+        mon -. "scrape / logs" .-> jenkins
+        mon -. "scrape / logs" .-> gateway
+        mon -. "scrape / logs" .-> hosting
+        mon -. "PVE exporter" .-> pve
     end
+
+    git["GitHub repos\n(app code + infra/manifests)"]
+    ghcr["GHCR container registry"]
+    agents -->|"push image"| ghcr
+    agents -->|"bump image tag"| git
+    flux -->|"pull manifests"| git
+    flux -->|"pull images"| ghcr
 ```
 
-**Actual web request flow:** `Client → Cloudflare → cloudflared on VM 100 → Nginx → (Traefik on workers OR Jenkins OR Hosting VM)`.
+**Web request flow:** `Client → Cloudflare → cloudflared (LXC 100) → Nginx → (Traefik VIP OR Jenkins OR Hosting VM)`.
 
-**Note:** The master controls cluster state but **does not sit in the HTTP request path** to apps. K3s worker HTTP ingress goes through Traefik and Kubernetes Services. The diagram is a conceptual overview; monitoring pods can be rescheduled across workers rather than fixed to particular nodes.
+**Delivery flow:** `git push → Jenkins → build pod (BuildKit) → GHCR → commit new tag to manifests repo → Flux reconciles → K3s`.
 
-## 5. Cloudflare and Nginx design
+## 6. Cloudflare and Nginx design
 
-- Use a **dedicated Cloudflare Tunnel** for the gateway, to avoid unintentionally breaking an existing tunnel.
-- Run the `cloudflared` connector **on VM 100**.
-- Run Nginx on VM 100, listening on **`127.0.0.1:80`** for tunnel traffic if the connector and Nginx are on the same VM.
-- Publish each desired hostname through Cloudflare Tunnel to `http://127.0.0.1:80`.
-- Configure Nginx virtual hosts to route by **Host** header.
-- Do **not** forward internet ports from the router to Proxmox or the VMs.
+- Use a **dedicated Cloudflare Tunnel** for this gateway so an existing tunnel isn't broken.
+- Run `cloudflared` and Nginx in **LXC 100**; Nginx listens on **`127.0.0.1:80`** for tunnel traffic.
+- Publish each hostname through the tunnel to `http://127.0.0.1:80`; Nginx routes by **Host** header.
+- Do **not** forward router ports to Proxmox or any guest.
+
+> **Alternative (fewer moving parts):** `cloudflared` can route hostnames directly to Traefik/Jenkins/hosting without Nginx. Run it as a 2-replica Deployment in K3s and drop LXC 100. Keep Nginx only if learning it is a goal.
 
 | DNS hostname | Nginx target | Security policy |
 |---|---|---|
-| `app.sopanha.digital` | Traefik on K3s workers, port 80 | Public or application-specific auth |
-| `api.sopanha.digital` | Traefik on K3s workers, port 80 | API authentication and rate limiting |
-| `grafana.sopanha.digital` | Traefik → Grafana Kubernetes Service | **Cloudflare Access** + Grafana login |
+| `app.sopanha.digital` | Traefik VIP `192.168.0.229:80` | Public or app-specific auth |
+| `api.sopanha.digital` | Traefik VIP `192.168.0.229:80` | API auth + rate limiting |
+| `grafana.sopanha.digital` | Traefik → Grafana Service | **Cloudflare Access** + Grafana login |
 | `jenkins.sopanha.digital` | `192.168.0.226:8080` | **Cloudflare Access** + Jenkins login |
-| `hosting.sopanha.digital` | `192.168.0.227:80` (when deployed) | Based on app sensitivity |
-| `n8n.sopanha.digital` | Hosting VM reverse proxy → n8n (optional) | **Cloudflare Access** if private |
+| `hosting.sopanha.digital` | `192.168.0.227:80` | Based on app sensitivity |
+| `n8n.sopanha.digital` | Hosting VM → n8n (optional) | **Cloudflare Access** if private |
 
-**Never publish** `192.168.0.225:5432` (PostgreSQL), the K3s API `:6443`, or unprotected Prometheus/Loki endpoints as public web routes. Keep Proxmox management private and use a separately secured private-access strategy if remote administration is necessary.
+**Never publish** PostgreSQL `:5432`, the K3s API `:6443`, Proxmox `:8006`, iLO, or unprotected Prometheus/Loki endpoints.
 
 ### Nginx routing example (outline)
 
 ```nginx
+# Use the kube-vip VIP once configured; until then list worker IPs.
 upstream k3s_ingress {
-    server 192.168.0.222:80;
-    server 192.168.0.223:80;
-    server 192.168.0.224:80;
+    server 192.168.0.229:80;
+    # server 192.168.0.222:80;
+    # server 192.168.0.223:80;
 }
 
-# Put inside Nginx's http context (usually /etc/nginx/conf.d/...)
 map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
@@ -194,255 +257,254 @@ server {
 }
 ```
 
-The example assumes K3s Traefik/ServiceLB exposes port 80 on the chosen worker IPs. Verify that these endpoints are reachable from VM 100 before using the upstream configuration. Also configure proper application-side proxy trust and authentication: **a Host header alone is not access control**.
+A Host header alone is not access control — configure app-side proxy trust and authentication.
 
-## 6. K3s cluster design
+## 7. K3s cluster design
 
-- **Control plane (VM 101):** K3s server managing the cluster. Initial setup can use the default embedded SQLite datastore.
-- **Workers (VMs 102–104):** Run websites, APIs, internal services, and the Grafana monitoring stack.
-- **Traefik Ingress:** Receives traffic from Nginx, then routes requests to Kubernetes Services and pods.
-- **Container runtime:** Bundled `containerd` provided by K3s.
-- **Persistent volumes:** Use a deliberate PV/StorageClass plan for Prometheus, Loki, and Grafana; default local-path PVs are **node-local**, not automatically replicated.
-- **Application configuration:** Use namespaces, requests/limits, health probes, and Secrets. Do not hard-code credentials in manifests or repositories.
+- **Control plane (VM 101):** K3s server with embedded SQLite; taint it `node-role.kubernetes.io/control-plane:NoSchedule` so apps land on workers.
+- **Workers (VMs 102–103):** Apps, monitoring, Flux, and Jenkins build pods.
+- **Ingress:** Traefik (bundled). Expose it on a single **kube-vip** VIP (`192.168.0.229`) so the gateway has one target; disable K3s `servicelb` if using kube-vip for LoadBalancer services.
+- **Storage:** `local-path` PVs are **node-local**. Pin stateful monitoring (Prometheus, Loki) with node affinity so pods don't lose their data on reschedule. Do **not** install Longhorn on this hardware — too heavy for a single disk.
+- **GitOps:** **Flux** (~200 MB) reconciles a `homelab-infra` repo. ArgoCD is an alternative if a UI is wanted (~1 GB).
+- **Secrets:** **SOPS + age**, decrypted by Flux at apply time. Never commit plaintext secrets.
+- **Hygiene:** namespaces, requests/limits on every pod, readiness/liveness probes, `LimitRange` defaults per namespace.
 
-### Kubernetes resource discipline
+### Resource discipline
 
-Each worker has **4 GB total**. This includes Ubuntu, kubelet/K3s, system pods, monitoring, and apps. Resource requests/limits must leave room for system components.
+Each worker has **6 GB total**; ~1–1.2 GB goes to Ubuntu, kubelet, containerd, flannel, and system pods, leaving **~4.8–5 GB for workloads**.
 
-Start with conservative monitoring settings, for example:
-
-| Component | Initial memory request | Initial memory limit | Notes |
+| Component | Memory request | Memory limit | Notes |
 |---|---:|---:|---|
-| Prometheus | 512 MiB | 1,024 MiB | Small scrape target count and 15-day retention; monitor usage. |
-| Loki (single binary) | 256 MiB | 768 MiB | Low log volume and 7-day retention. |
-| Grafana | 128 MiB | 512 MiB | Few dashboards/users. |
-| Alloy | 64 MiB per agent | 256 MiB per agent | Agent count varies by DaemonSet and integrations. |
+| Prometheus | 768 MiB | 1,536 MiB | 15-day retention, 30 s scrape. Swap for **VictoriaMetrics single** (3–5× less RAM/disk) if tight. |
+| Loki (single binary) | 256 MiB | 768 MiB | 7-day retention via compactor. |
+| Grafana | 128 MiB | 512 MiB | |
+| Alloy (DaemonSet) | 64 MiB/node | 256 MiB/node | |
+| kube-state-metrics | 64 MiB | 128 MiB | |
+| Flux controllers | 128 MiB | 512 MiB | Combined. |
+| Jenkins build pod | 1 GiB | 2 GiB | **One concurrent build** to start. |
 
-These are **starting estimates, not guaranteed requirements**. kube-state-metrics, exporters, Traefik, OS usage, and Kubernetes overhead consume additional memory. Adjust actual limits based on measured usage and prevent monitoring from evicting application pods.
+Set a lower `PriorityClass` for monitoring and build pods than for apps, so pressure evicts those first.
 
-## 7. Grafana monitoring and centralized logs
+## 8. Monitoring and centralized logs
 
-Monitoring runs **in K3s**; there is **no separate monitoring VM**.
+Monitoring runs **in K3s**; there is no monitoring VM.
 
 | Component | Where | Purpose |
 |---|---|---|
-| Grafana | K3s Deployment | Dashboards, metrics exploration, logs, alerting |
-| Prometheus | K3s StatefulSet / Helm deployment | Metrics scraping and time-series storage |
-| Loki | K3s deployment with persistent storage | Central log query/storage |
-| Grafana Alloy | K3s DaemonSet + agents on selected VMs | Container/system log shipping and other telemetry |
-| Node Exporter | Linux VMs and/or K3s hosts | CPU, memory, disk, network |
-| kube-state-metrics | K3s | Deployments, pods, resource state |
-| PVE exporter | Monitoring integration | Proxmox host/VM metrics via read-only API credentials |
-| PostgreSQL exporter | DB VM or service | Database health and connections |
-| Jenkins metrics plugin/exporter | Jenkins VM | Job/queue/executor information |
+| Grafana | K3s Deployment | Dashboards, exploration, alerting |
+| Prometheus (or VictoriaMetrics) | K3s StatefulSet, pinned node | Metrics storage |
+| Loki | K3s, pinned node, PV | Log storage |
+| Grafana Alloy | K3s DaemonSet + systemd agent on VMs/LXCs | Logs and host telemetry |
+| Node Exporter | All VMs; Proxmox host | CPU, memory, disk, network |
+| kube-state-metrics | K3s | Workload state |
+| PVE exporter | K3s pod → Proxmox API (read-only token) | Host / guest metrics, **thin-pool usage** |
+| PostgreSQL exporter | LXC 105 | DB health |
+| Jenkins Prometheus plugin | VM 106 | Jobs, queue, executors |
 
-### What Grafana should show
+### Dashboards
 
-1. **Proxmox overview:** Physical CPU utilization, memory pressure, SSD usage, VM uptime.
-2. **VM dashboard:** CPU/memory/disk/network for all eight VMs.
-3. **K3s dashboard:** Node Ready state, pod CPU/memory, restarts, deployments, pending pods.
-4. **Web application dashboard:** Request rates, HTTP 4xx/5xx, latency **when instrumented**.
-5. **Jenkins dashboard:** Job duration, queue, successes/failures, executor use.
-6. **PostgreSQL dashboard:** Connections, locks, cache hit rate, disk growth.
-7. **Log explorer:** K3s pod stdout/stderr; Nginx access/error logs; Jenkins, PostgreSQL, and system logs.
+1. **Proxmox overview:** host CPU, memory, **thin-pool data/metadata %**, guest uptime.
+2. **Guests:** CPU/memory/disk/network for all seven guests.
+3. **K3s:** node Ready, pod resources, restarts, pending pods, Flux reconciliation status.
+4. **Web apps:** request rate, 4xx/5xx, latency (when instrumented).
+5. **CI/CD:** Jenkins job duration, queue, failures; Flux sync failures.
+6. **PostgreSQL:** connections, locks, cache hit rate, size growth.
+7. **Logs:** pod stdout/stderr, Nginx, Jenkins, PostgreSQL, system logs.
 
-### Initial data retention
+### Retention
 
-| Data | Starting policy |
+| Data | Policy |
 |---|---|
-| Prometheus metrics | **15 days** |
-| Loki logs | **7 days** |
-| Prometheus scrape interval | **30 seconds** |
-| Debug logs | Collect only when needed |
-| Disk alerts | Warn before monitoring storage fills |
+| Metrics | **15 days**, 30 s scrape |
+| Logs | **7 days** (compactor-enforced) |
+| Debug logs | Only when needed |
 
-Enforce Loki retention with the appropriate compactor configuration, not just a dashboard setting. Size the PVs based on actual ingestion volume and available SSD space.
+### Alerts
 
-### Suggested alerts
+- Host CPU > 85–90% for 10 min; host memory low / swap rising.
+- **Thin pool data or metadata > 80%.**
+- Any PV or guest disk > 80–85%.
+- K3s node NotReady; crash-looping pods; Flux reconciliation failing.
+- Jenkins queue growing / repeated failures.
+- PostgreSQL down or connection saturation.
+- Nginx 5xx rate high; monitoring targets down.
+- PBS backup job failed or not run in 26 h.
 
-- Proxmox CPU above ~85–90% for at least 5–10 minutes.
-- Available host memory low / swap activity rising.
-- SSD/persistent-volume usage above 80–85%.
-- K3s node NotReady or repeated container restarts.
-- Jenkins build queue growing / repeated failures.
-- PostgreSQL down, unhealthy connections, or disk growth.
-- Nginx high 5xx error rate; application probes failing.
-- Monitoring targets down or Alloy failing to forward logs.
+Monitoring shares the host, so a **host outage silences alerts**. Add an **external uptime check** (e.g., Cloudflare Health Checks, UptimeRobot, Healthchecks.io) for public endpoints and a backup heartbeat.
 
-Because the monitoring stack runs on the same physical server, **an entire host outage can prevent Grafana from sending an alert**. Use one external uptime check for critical public endpoints if outage notifications matter.
+## 9. Dedicated hosting server (VM 107)
 
-## 8. Dedicated hosting server (VM 107)
+- IP `192.168.0.227`, **2 vCPU / 4 GB / 40 GB**
+- Ubuntu Server, Docker Engine, Docker Compose, optional local reverse proxy (Caddy/Traefik)
+- Workloads: n8n, bots, dev websites, small self-hosted apps
+- Optional: lightweight `registry:2` if a private local registry is preferred over GHCR
+- Public only via Cloudflare Tunnel → gateway when explicitly allowed
+- Compose files kept in Git and deployed via Ansible or a Jenkins job
 
-The dedicated hosting VM **remains available** and is not replaced by monitoring.
+## 10. CI/CD pipeline
 
-**VM 107: `hosting-server`**
-
-- IP: `192.168.0.227`
-- vCPU: 1
-- RAM: 4 GB
-- Disk: 40 GB SSD-backed virtual disk
-- Software: Ubuntu Server, Docker Engine, Docker Compose, optional local reverse proxy
-- Possible workloads: n8n, bots, development websites, small self-hosted applications, utility APIs
-- Public access: Cloudflare Tunnel → Nginx Gateway → hosting VM (only when explicitly allowed)
-
-Avoid running many CPU-intensive containers simultaneously on this one-vCPU VM. Use K3s for workloads that benefit from Kubernetes orchestration.
-
-## 9. Jenkins and deployment pipeline
-
-Jenkins VM 106 has **2 vCPUs, 3 GB RAM**. Initially limit concurrent resource-heavy jobs.
-
-**Suggested workflow:**
+**Jenkins = CI (build/test/publish). Flux = CD (deploy).**
 
 ```text
-Git push / webhook
-    → Jenkins job
-    → Build + unit tests
-    → Build container image
-    → Push to trusted container registry
-    → Deploy into K3s with narrowly scoped credentials
-    → Readiness check / rollback on failure
-    → Grafana metrics + Loki logs
+git push (app repo)
+  → GitHub webhook → Jenkins controller (VM 106)
+  → Kubernetes plugin spawns ephemeral build pod on a worker
+      → unit tests
+      → build image with BuildKit (rootless) or Kaniko
+      → push to ghcr.io/<user>/<app>:<git-sha>
+      → commit new image tag to homelab-infra repo
+  → Flux detects change → applies to K3s
+  → readiness check; rollback = git revert
+  → Grafana metrics + Loki logs
 ```
 
-Recommended safeguards:
+Safeguards:
 
-- Limit heavy Jenkins builds to **one concurrent job** initially.
-- Consider `qm set 106 --cpulimit 1` to cap Jenkins to approximately one physical CPU core's worth of runtime during contention; test throughput after applying.
-- Do not use the K3s master administrator kubeconfig inside Jenkins; prefer a dedicated, least-privilege deployment identity.
-- Store registry credentials, tokens and keys in protected credential stores.
-- Keep Jenkins behind Cloudflare Access **and** Jenkins authentication.
+- **One concurrent build** initially; build pods have explicit CPU/memory limits.
+- Jenkins controller runs **0 executors** — no builds on VM 106.
+- Jenkins holds **no cluster-admin kubeconfig**: only a namespaced ServiceAccount allowed to create pods in `ci`, plus a GitHub deploy key for the infra repo.
+- Registry/GitHub tokens in Jenkins Credentials; never in Jenkinsfiles.
+- Jenkins behind Cloudflare Access **and** Jenkins auth.
 
-## 10. Database design
+## 11. Database (LXC 105)
 
-**VM 105: `database`** runs PostgreSQL and should accept connections only from approved application sources.
+- Unprivileged LXC, Ubuntu 24.04, PostgreSQL 16+
+- IP `192.168.0.225`, port `5432` **private**
+- `pg_hba.conf` allows only K3s worker IPs (pod traffic is SNAT'd to node IPs by flannel) and Jenkins if needed
+- Per-app roles/databases, strong passwords, TLS for sensitive data
+- Nightly `pg_dump` to the PBS/HDD datastore **and** off-site; test restores
+- Proxmox firewall on the container: allow 5432 only from `.222`, `.223`
 
-- IP: `192.168.0.225`
-- TCP port: `5432`, **private**
-- Allow authorized K3s nodes/application traffic; verify whether pod traffic uses worker IP masquerading or pod CIDRs.
-- Use restricted application accounts, strong passwords, and TLS for sensitive use.
-- Schedule database dumps to **off-server storage** and test restoring them.
-- Track connections, storage growth, and errors with PostgreSQL exporter and Alloy.
+## 12. Infrastructure as code
 
-## 11. Security and network isolation
+All guests and configuration live in a `homelab-infra` Git repo:
 
-1. **Cloudflare Tunnel** uses outbound connectivity; do not configure router port forwarding for your websites.
-2. **Cloudflare Zero Trust Access** is required for Jenkins, Grafana, and other administrative apps.
-3. **Nginx loopback listener** minimizes LAN exposure of the tunnel entry point.
-4. **Proxmox UI, K3s API, PostgreSQL, Prometheus and Loki** stay private.
-5. **SSH** restricted to trusted management hosts or a properly configured secure access method.
-6. **Proxmox Firewall / VLANs** can further isolate database and management services.
-7. Protect the cluster's K3s join token, Cloudflare Tunnel credentials, database secrets and Jenkins credentials.
-8. Keep Ubuntu, K3s, Jenkins, Grafana, Nginx and cloudflared updated.
-9. Restrict Kubernetes API port `6443`, Flannel networking (typically UDP `8472` when VXLAN is used), and monitoring exporter ports to trusted sources.
-10. Use origin-side Access validation where supported, in addition to Cloudflare Access policies.
+| Layer | Tool | What it manages |
+|---|---|---|
+| Guests | **OpenTofu/Terraform** + `bpg/proxmox` provider | VMs, LXCs, disks, cloud-init, IPs |
+| OS config | **Ansible** | Packages, users/SSH keys, Docker, Nginx, cloudflared, PostgreSQL, Jenkins, Alloy, node-exporter, K3s install |
+| Cluster | **Flux** | Traefik config, monitoring stack, apps |
+| Secrets | **SOPS + age** | Encrypted values in Git |
 
-## 12. Stability, performance and failure planning
+Goal: any guest can be destroyed and rebuilt from Git + backups.
 
-### CPU — Xeon E-2224
+## 13. Security and isolation
 
-Four physical cores can handle this design at **light load** because the VMs usually do not demand full CPU at the same time. It is **not** equivalent to having 14 physical cores.
+1. Cloudflare Tunnel only; **no router port forwarding**.
+2. **Cloudflare Access** in front of Jenkins, Grafana, n8n, and any admin UI.
+3. **Tailscale** (subnet router on the Proxmox host) for SSH, Proxmox UI, and iLO access from outside.
+4. Proxmox UI, iLO, K3s API, PostgreSQL, Prometheus, Loki stay private.
+5. SSH keys only; disable password auth and root SSH on guests.
+6. **Proxmox firewall** enabled at datacenter level; per-guest rules (DB only from workers, `6443` only from LAN admin + workers, flannel UDP `8472` only between K3s nodes).
+7. Unprivileged LXCs for gateway and PostgreSQL.
+8. Protect K3s join token, tunnel credentials, age key, DB and Jenkins secrets (age private key backed up offline).
+9. Regular updates: `unattended-upgrades` on guests; scheduled Proxmox, K3s, Jenkins, Grafana updates.
+10. Validate Cloudflare Access JWT at origin where supported.
+
+## 14. Backups
+
+| What | Tool | Destination | Schedule | Retention |
+|---|---|---|---|---|
+| All VMs/LXCs | **Proxmox Backup Server** (on host, datastore on HDD) | 2–4 TB HDD in LFF bay | Nightly | 7 daily, 4 weekly, 3 monthly |
+| PostgreSQL | `pg_dump` | PBS datastore + off-site | Nightly | 14 days |
+| Off-site copy | PBS sync / `rclone` | Cloud (Backblaze B2 / R2) or second machine | Weekly | 4 weeks |
+| Infra config | Git | GitHub | On change | Full history |
+
+The HDD protects against SSD failure and bad changes, **not** against loss of the whole server — off-site copy is required for that. Test a VM restore and a DB restore at least once.
+
+## 15. Stability and failure planning
 
 | Situation | Likely result | Action |
 |---|---|---|
-| Normal low-traffic workloads | Usually responsive | Monitor CPU and latency |
-| Heavy Jenkins build | Slower K3s workloads possible | Limit builds; cap Jenkins CPU if needed |
-| 100% CPU for several minutes | Queuing, timeouts, delayed jobs | Reduce workload; review CPU pressure |
-| Memory exhaustion | VM/pod out-of-memory kills possible | Enforce pod limits; monitor host memory |
-| SSD fills up | Databases, logs and apps may fail | Retention, disk alerts, external backups |
-| Physical server or SSD failure | All eight VMs affected | Off-server backups; no HA guarantee |
+| Normal low traffic | Responsive | Monitor CPU/latency |
+| Jenkins build running | Workers slower | 1 concurrent build; pod CPU limits |
+| Sustained 100% CPU | Timeouts, probe failures | Reduce load; check which guest |
+| Memory exhaustion | OOM kills of pods/guests | Limits, PriorityClasses, host memory alert |
+| **Thin pool full** | **All guests I/O-error, possible corruption** | Alert at 80%; keep allocations < pool size |
+| SSD failure | All guests down | Restore from PBS HDD / off-site |
+| Whole server lost | Everything down | Rebuild from Git (IaC) + off-site backups |
 
-**CPU saturation alone normally slows services instead of crashing the physical host.** However, services can time out or restart because health checks miss deadlines. Excessive heat or hardware faults can still cause shutdowns.
+## 16. Deployment phases and acceptance checks
 
-### SSD — 500 GB
+### Phase 0 — Host
 
-The SSD is appropriate for a homelab. However, **350 GB of virtual disks is not the same as 350 GB of guaranteed free physical SSD space**. The host installation and Proxmox storage pools consume capacity, and snapshots/backups require additional room.
+- [ ] Update BIOS/iLO firmware; configure iLO on private LAN.
+- [ ] Verify CPU, 32 GB RAM, SSD SMART health.
+- [ ] Install Proxmox with `maxroot=30`, `swapsize=4`, `minfree=16`; confirm `local-lvm` ≈ 400 GiB.
+- [ ] Configure no-subscription repo, updates, Proxmox firewall, Tailscale.
+- [ ] Install backup HDD; set up Proxmox Backup Server datastore.
+- [ ] Confirm free guest IDs and `.220`–`.229` IPs.
 
-Check before provisioning:
+### Phase 1 — IaC and guests
 
-```bash
-pvesm status
-lsblk
-qm list
-free -h
-```
+- [ ] Create `homelab-infra` repo (OpenTofu + Ansible + Flux + SOPS layout).
+- [ ] Build an Ubuntu 24.04 cloud-init VM template; download Ubuntu LXC template.
+- [ ] Provision 5 VMs + 2 LXCs from OpenTofu with Section 4 sizes, `discard=on`, CPU `host`.
+- [ ] Ansible baseline: SSH keys, guest agent, `unattended-upgrades`, node-exporter, Alloy, `fstrim.timer`.
 
-Avoid storing the **only** Proxmox backups on this SSD.
+### Phase 2 — K3s
 
-## 13. Deployment phases and acceptance checks
-
-### Phase 0 — Validate the host
-
-- [ ] Verify CPU, 32 GB RAM, SSD health, and actual Proxmox storage pools.
-- [ ] Check existing VM IDs (100–107 may be in use) and choose free IDs.
-- [ ] Confirm `.220`–`.227` IP availability and router reservations.
-- [ ] Confirm `vmbr0`, default gateway, and outbound internet access.
-
-### Phase 1 — Create VMs
-
-- [ ] Import an Ubuntu Server cloud image and create a Cloud-Init template.
-- [ ] Clone eight VMs with the RAM/vCPU/disk/IP plan in Section 3.
-- [ ] Configure SSH keys, `qemu-guest-agent`, automatic boot, and updates.
-- [ ] Confirm SSH and unique VM identity on each guest.
-
-### Phase 2 — Build K3s
-
-- [ ] Install K3s server on VM 101.
-- [ ] Join workers 102, 103, and 104.
-- [ ] Confirm four `Ready` nodes and healthy core system pods.
-- [ ] Deploy a small test web service and configure Traefik Ingress.
+- [ ] Install K3s server on VM 101 (taint control plane).
+- [ ] Join workers 102, 103; confirm 3 `Ready` nodes.
+- [ ] Install kube-vip for VIP `192.168.0.229`; verify Traefik on the VIP.
+- [ ] Bootstrap Flux against `homelab-infra`; configure SOPS decryption.
+- [ ] Deploy a test app via Git commit only.
 
 ### Phase 3 — Supporting services
 
-- [ ] Install PostgreSQL on VM 105 with private networking and backup policy.
-- [ ] Install Jenkins on VM 106 and restrict build concurrency.
-- [ ] Install Docker/Compose on VM 107 and deploy a test hosting page.
+- [ ] PostgreSQL in LXC 105; firewall rules; nightly dumps.
+- [ ] Jenkins controller on VM 106 (0 executors); Kubernetes plugin → `ci` namespace.
+- [ ] Docker/Compose on VM 107; deploy a test page.
 
 ### Phase 4 — Gateway and public access
 
-- [ ] Install Nginx and cloudflared on VM 100.
-- [ ] Configure Nginx virtual hosts and verify LAN/loopback routing.
-- [ ] Create/use a dedicated Cloudflare Tunnel and hostname routes.
-- [ ] Protect Jenkins and Grafana with Access policies before public access.
-- [ ] Test `app`, `jenkins`, `grafana`, and `hosting` URLs.
+- [ ] Nginx + cloudflared in LXC 100.
+- [ ] Dedicated tunnel and hostname routes.
+- [ ] Cloudflare Access on Jenkins, Grafana, n8n **before** going public.
+- [ ] Test `app`, `api`, `jenkins`, `grafana`, `hosting`.
 
 ### Phase 5 — Monitoring
 
-- [ ] Deploy Grafana, Prometheus, Loki, and Alloy **inside K3s**.
-- [ ] Install/configure Node Exporter and PVE exporter.
-- [ ] Configure Kubernetes, Jenkins, PostgreSQL and Nginx metrics/logs.
-- [ ] Verify logs are searchable by VM, namespace and service in Grafana.
-- [ ] Set 15-day metrics / 7-day log retention and appropriate PV limits.
-- [ ] Enable alerts for CPU, memory, SSD capacity and service health.
+- [ ] Deploy Grafana, Prometheus (or VictoriaMetrics), Loki, Alloy via Flux.
+- [ ] PVE exporter (read-only API token), PostgreSQL exporter, Jenkins plugin.
+- [ ] Pin Prometheus/Loki PVs; set retention; set PriorityClasses.
+- [ ] Alerts from Section 8, including thin-pool usage; external uptime check.
 
-### Phase 6 — Operations readiness
+### Phase 6 — CI/CD end-to-end
 
-- [ ] Schedule regular backups **off the Proxmox server**.
-- [ ] Perform at least one database restore and one VM restore test.
-- [ ] Validate Cloudflare access removal/session revocation for admin apps.
-- [ ] Run a controlled Jenkins build while observing CPU and service latency.
-- [ ] Document the VM identifiers, service owners, restore steps and update procedure.
+- [ ] Webhook → Jenkins → build pod → GHCR → infra repo tag bump → Flux deploy.
+- [ ] Observe host CPU and app latency during a build.
+- [ ] Rollback via `git revert` works.
 
-## 14. Quick verification commands
+### Phase 7 — Operations readiness
+
+- [ ] PBS nightly jobs green; off-site sync configured.
+- [ ] Test restore: one VM, one LXC, one database.
+- [ ] Test rebuild: destroy and recreate a worker from IaC.
+- [ ] Revoke a Cloudflare Access session and confirm lockout.
+- [ ] Document IDs, IPs, restore steps, update procedure.
+
+## 17. Quick verification commands
 
 **Proxmox host:**
 
 ```bash
-qm list
+qm list && pct list
 pvesm status
-free -h
-uptime
+lvs -o lv_name,data_percent,metadata_percent pve
+free -h && uptime
 ```
 
-**K3s master:**
+**K3s server:**
 
 ```bash
 sudo k3s kubectl get nodes -o wide
 sudo k3s kubectl get pods -A
-sudo k3s kubectl get ingress -A
-sudo k3s kubectl top nodes   # if metrics-server is installed and healthy
+sudo k3s kubectl top nodes
+flux get kustomizations -A
 ```
 
-**Gateway:**
+**Gateway (LXC 100):**
 
 ```bash
 sudo nginx -t
@@ -457,34 +519,45 @@ curl -I https://app.sopanha.digital
 curl -I https://hosting.sopanha.digital
 ```
 
-For protected sites such as Jenkins or Grafana, a redirect to Cloudflare Access is expected before authentication.
+Jenkins and Grafana should redirect to Cloudflare Access before authentication.
 
-## 15. Final decision and next upgrades
+## 18. Final decision and upgrade path
 
 **Approved target layout:**
 
-- **8 VMs** with **26 GB assigned RAM** and **14 vCPUs**.
-- **6 GB nominal host memory headroom**.
-- **350 GB total planned virtual disks** on the **500 GB SSD**, subject to verified storage availability.
-- **Dedicated Docker hosting server preserved as VM 107**.
-- **Monitoring inside the K3s workers**, not on another VM.
-- **Cloudflare Tunnel → Nginx → K3s / Jenkins / hosting**.
-- **PostgreSQL and management APIs kept private**.
+- **5 VMs + 2 LXCs**, **25 GB RAM**, **15 vCPUs**, **278 GB disk**.
+- **~7 GB host RAM headroom**, **~120 GB thin-pool headroom**.
+- K3s **1 server + 2 workers (6 GB each)**; monitoring and CI agents in-cluster.
+- **Jenkins CI + Flux GitOps**, images in **GHCR**.
+- **Cloudflare Tunnel → Nginx (LXC) → K3s / Jenkins / hosting**.
+- Everything defined in **OpenTofu + Ansible + Flux**; backups to **PBS on HDD + off-site**.
 
-**Upgrade triggers:** Upgrade to a supported higher-core-count CPU if sustained CPU contention becomes normal; consider **64 GB RAM** if K3s monitoring/apps or additional VMs need more space; increase SSD capacity or add dedicated storage if monitoring retention and application data grow. Add **external backup storage first** if you do not already have an off-server backup target.
+**Upgrade order:**
+
+1. **Backup HDD** (if not already installed) — do this first.
+2. **RAM → 64 GB** (4 × 16 GB ECC UDIMM) — cheapest, biggest gain; then add `k3s-worker3` (VM 104) and raise worker RAM.
+3. **Second SSD** — separate guest data from the Proxmox OS, or mirror.
+4. **CPU** (e.g., Xeon E-2236/E-2246G, 6C/12T — verify ML30 Gen10 compatibility and BIOS) only if sustained CPU contention becomes normal.
 
 ---
 
-## 16. Official reference documentation
+## 19. Official reference documentation
 
-- Proxmox VE administration: <https://pve.proxmox.com/pve-docs/>
-- K3s documentation: <https://docs.k3s.io/>
+- Proxmox VE: <https://pve.proxmox.com/pve-docs/>
+- Proxmox Backup Server: <https://pbs.proxmox.com/docs/>
+- K3s: <https://docs.k3s.io/>
+- kube-vip: <https://kube-vip.io/docs/>
+- Flux: <https://fluxcd.io/flux/>
+- SOPS: <https://github.com/getsops/sops>
+- OpenTofu: <https://opentofu.org/docs/> · bpg/proxmox provider: <https://registry.terraform.io/providers/bpg/proxmox/latest/docs>
+- Ansible: <https://docs.ansible.com/>
 - Grafana: <https://grafana.com/docs/grafana/latest/>
-- Prometheus: <https://prometheus.io/docs/>
+- Prometheus: <https://prometheus.io/docs/> · VictoriaMetrics: <https://docs.victoriametrics.com/>
 - Grafana Loki: <https://grafana.com/docs/loki/latest/>
 - Grafana Alloy: <https://grafana.com/docs/alloy/latest/>
-- Jenkins: <https://www.jenkins.io/doc/>
+- Jenkins Kubernetes plugin: <https://plugins.jenkins.io/kubernetes/>
 - Cloudflare Tunnel: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/>
 - Cloudflare Access: <https://developers.cloudflare.com/cloudflare-one/access-controls/>
+- Tailscale subnet routers: <https://tailscale.com/kb/1019/subnets>
 
-*This document is the final planned architecture based on the specified hardware and requirements, not a claim that any VM or service has already been deployed.*
+*This document is the planned architecture for the specified hardware, not a claim that any guest or service has already been deployed.*
